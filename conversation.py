@@ -53,12 +53,12 @@ def get_state_by_name(state_name: str,
 
 
 async def process_exception(exception: HandleException):
-    """Send message with exception text [current Chat] or await Awaitable."""
+    """Send message if exception has text [current Chat] or await Awaitable."""
     chat = types.Chat.get_current()
     bot = Bot.get_current()
     e_body = exception.on_exception
 
-    if isinstance(e_body, str):
+    if isinstance(e_body, str) and e_body:
         await bot.send_message(chat.id, e_body)
     elif isinstance(e_body, Awaitable):
         await e_body
