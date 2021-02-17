@@ -21,7 +21,7 @@ class CheckMembership(BaseMiddleware):
 
     def __init__(self, chat_username: str, error_text=None):
         if not error_text:
-            error_text = f'Cначала вступите в сообщество: {chat_username}'
+            error_text = f'Error, you are not member of {chat_username}'
         self.chat = chat_username
         self.error_text = error_text
         super().__init__()
