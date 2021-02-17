@@ -1,22 +1,51 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable
-from typing import TypeVar, Union, Optional
+from dataclasses import dataclass
+from dataclasses import field
+from typing import TypeVar, Union, Optional, Literal
 
 from aiogram import types, Dispatcher, Bot
-from aiogram.contrib.questions import ConvState, ConvStatesGroup, HandleException
+from aiogram.contrib.questions import ConvState, ConvStatesGroup
 from aiogram.contrib.questions import Quest, QuestText, QuestFunc
+from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.middlewares import BaseMiddleware
 
-__all__ = ['UserDataUpdater', 'SwitchConvState', 'AskQuestion']
+# выход после обработки, выход без обработки, выход с исключением
+
+
+__all__ = ['UserDataUpdater', 'SwitchConvState', 'get_current_state']
 
 T = TypeVar('T')
+StorageData = Union[str, int, list, None]
 
 
-def recursive_search_obj(obj_type: type[T], container: Union[list, tuple]) -> T:
+def to_list(obj) -> list:
+    if not isinstance(obj, list):
+        obj = [obj]
+    return obj
+
+
+def get_state_by_name(
+        state_name: str, base_states_group: type[ConvStatesGroup] = ConvStatesGroup
+) -> Optional[ConvState]:
+    """Search for State with state_name in subclasses of base_states_group."""
+    for state in base_states_group.all_conv_states:
+        if state.state == state_name:
+            return state
+
+
+async def get_current_state() -> Optional[ConvState]:
+    state_ctx = Dispatcher.get_current().current_state()
+    state_name = await state_ctx.get_state()
+    return get_state_by_name(state_name)
+
+
+def search_in_results(obj_type: type[T], container: list) -> Optional[T]:
     """Recursive search for instance of obj_type in lists/tuples."""
     if isinstance(container, (list, tuple)):
         for item in container:
-            obj = recursive_search_obj(obj_type, item)
+            obj = search_in_results(obj_type, item)
             if obj is not None:  # object found
                 return obj
     else:
@@ -24,55 +53,59 @@ def recursive_search_obj(obj_type: type[T], container: Union[list, tuple]) -> T:
             return container
 
 
-async def update_user_data(new_data: dict):
-    """Set, delete or extend values in storage for current User+Chat."""
-    state_ctx = Dispatcher.get_current().current_state()
-
-    async with state_ctx.proxy() as udata:
-        for key, value in new_data.items():
-
-            # extend value with list
-            if isinstance(value, list):
-                udata.setdefault(key, [])
-                udata[key].extend(value)
-
-            # delete key
-            elif isinstance(value, tuple) and not value:
-                del udata[key]
-
-            else:  # just set value
-                udata[key] = value
-
-
-def get_state_by_name(state_name: str,
-                      base_states_group: type[ConvStatesGroup] = ConvStatesGroup) -> Optional[ConvState]:
-    """Search for State with state_name in subclasses of base_states_group."""
-    for state in base_states_group.all_conv_states:
-        if state.state == state_name:
-            return state
-
-
-async def process_exception(exception: HandleException):
-    """Send message if exception has text [current Chat] or await Awaitable."""
+async def ask_question(question: Union[Quest, list[Quest]]):
+    """Send message for each Quest in question [current Chat]."""
     chat = types.Chat.get_current()
     bot = Bot.get_current()
-    e_body = exception.on_exception
 
-    if isinstance(e_body, str) and e_body:
-        await bot.send_message(chat.id, e_body)
-    elif isinstance(e_body, Awaitable):
-        await e_body
+    async def ask_quest(quest: Quest):
+        if isinstance(quest, str):
+            await bot.send_message(chat.id, quest)
+        elif isinstance(quest, QuestText):
+            await bot.send_message(chat.id, quest.text, reply_markup=quest.keyboard)
+        elif isinstance(quest, QuestFunc):
+            await quest.async_func()
+
+    for q in to_list(question):
+        await ask_quest(q)
 
 
-async def ask_question(question: list[Quest]):
-    """Send QuestText to current Chat or await QuestFunc."""
-    for item in question:
-        if isinstance(item, QuestText):
-            chat = types.Chat.get_current()
-            bot = Bot.get_current()
-            await bot.send_message(chat.id, item.text, reply_markup=item.keyboard)
-        elif isinstance(item, QuestFunc):
-            await item.func
+@dataclass
+class HandleException:
+    on_exception: Quest = None
+    new_state: Union[Literal['previous'], type[ConvStatesGroup], ConvState] = None
+    on_conv_exit: Quest = None
+
+    async def set_new_state(self):
+        if isinstance(self.new_state, ConvState):
+            await self.new_state.set()
+        elif isinstance(self.new_state, type[ConvStatesGroup]):
+            await self.new_state.first()
+        elif self.new_state == 'previous':
+            conv_state: ConvState = await get_current_state()
+            if conv_state and conv_state.group:
+                new_state = conv_state.group.previous()
+                if new_state is None and self.on_conv_exit:
+                    await ask_question(self.on_conv_exit)
+
+
+@dataclass
+class NewData:
+    set_items: dict[str, StorageData] = field(default_factory=dict)
+    extend_items: dict[str, StorageData] = field(default_factory=dict)
+    del_keys: Union[str, list] = field(default_factory=list)
+
+    async def update_proxy(self, state_ctx: FSMContext):
+        """Set, extend or delete items with state_ctx.proxy()."""
+        async with state_ctx.proxy() as udata:
+            udata.update(self.set_items)
+
+            for key, value in self.extend_items.items():
+                udata.setdefault(key, [])
+                udata[key].extend(to_list(value))
+
+            for key in to_list(self.del_keys):
+                del udata[key]
 
 
 class PostMiddleware(BaseMiddleware, ABC):
@@ -91,55 +124,34 @@ class PostMiddleware(BaseMiddleware, ABC):
 
 
 class UserDataUpdater(PostMiddleware):
-    """Search for dict in results. Update storage for current User+Chat with dict data.
-
-    For each item in dict:
-    1) Extend value in storage if list passed
-    2) Delete key in storage if empty tuple passed
-    3) Just set value otherwise
-    """
+    """Search for NewData(...) in handle results. Update storage for current User+Chat with new data."""
 
     @classmethod
     async def on_post_process_message(cls, msg: types.Message, results: list, *args):
-        new_data = recursive_search_obj(dict, results)
-        if new_data:
-            await update_user_data(new_data)
+        state_ctx = Dispatcher.get_current().current_state()
+        new_data = search_in_results(NewData, results)
+        await new_data.update_proxy(state_ctx)
 
 
 class SwitchConvState(PostMiddleware):
     """Switch state for current User+Chat [if user is in conversation].
 
-    If HandleException in handle results - process exception;
-    Else if ConvStateGroup in handle results - set first state in group;
-    Else if user is in conversation - set next state in group;
+    # If HandleException in handle results - process exception;
+    # Else if ConvStateGroup in handle results - set first state in group;
+    # Else if user is in conversation - set next state in group;
     """
 
     @classmethod
     async def on_post_process_message(cls, msg: types.Message, results: list, *args):
-        state_ctx = Dispatcher.get_current().current_state()
-        state_name = await state_ctx.get_state()
-        conv_state = get_state_by_name(state_name, ConvStatesGroup)
-        new_conv_group = recursive_search_obj(ConvStatesGroup.__class__, results)
-        exception = recursive_search_obj(HandleException, results)
+        conv_state: ConvState = get_current_state()
+        exception = search_in_results(HandleException, results)
 
         if exception:
-            await process_exception(exception)
-        elif new_conv_group:
-            await new_conv_group.first()
-        elif conv_state:
+            await ask_question(exception.on_exception)
+            await exception.set_new_state()
+        elif conv_state and conv_state.group:
             await conv_state.group.next()
-
-
-class AskQuestion(PostMiddleware):
-    """Ask question for ConvState(...) or clear storage for current User+Chat."""
-
-    @classmethod
-    async def on_post_process_message(cls, msg: types.Message, results: list, *args):
-        state_ctx = Dispatcher.get_current().current_state()
-        state_name = await state_ctx.get_state()
-        conv_state = get_state_by_name(state_name, ConvStatesGroup)
-
-        if conv_state:
             await ask_question(conv_state.question)
         else:
+            state_ctx = Dispatcher.get_current().current_state()
             await state_ctx.finish()
