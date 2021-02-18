@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from dataclasses import field
-from typing import TypeVar, Union, Optional, cast
+from typing import TypeVar, Union, Optional
 
 from aiogram import types, Dispatcher, Bot
 from aiogram.contrib.questions import ConvState, ConvStatesGroup
@@ -11,7 +11,7 @@ from aiogram.contrib.questions import Quest, Quests, QuestText, QuestFunc
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.middlewares import BaseMiddleware
 
-# выход после обработки, выход без обработки, выход с исключением
+# TODO: проверка на обработку
 
 
 __all__ = ['UserDataUpdater', 'SwitchConvState', 'HandleException', 'NewData', 'NewState']
@@ -65,7 +65,7 @@ class HandleException:
 class NewData:
     set: dict[str, StorageData] = field(default_factory=dict)
     extend: dict[str, StorageData] = field(default_factory=dict)
-    delete: Union[str, list] = field(default_factory=list)
+    delete: Union[str, list[str]] = field(default_factory=list)
 
     async def update_proxy(self, state_ctx: FSMContext):
         """Set, extend or delete items in storage for current User+Chat."""
@@ -102,7 +102,7 @@ class NewState:
 
     # async def set_state(self) -> Optional[ConvState]:
     #     """Set specific state, previous state or first state in group."""
-    # 
+    #
     #     if next_state:
     #         await next_state.set()
     #     else:
