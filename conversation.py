@@ -3,42 +3,29 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from dataclasses import field
-from typing import TypeVar, Union, Optional, Literal
+from typing import TypeVar, Union, Optional, cast
 
 from aiogram import types, Dispatcher, Bot
 from aiogram.contrib.questions import ConvState, ConvStatesGroup
-from aiogram.contrib.questions import Quest, QuestText, QuestFunc
+from aiogram.contrib.questions import Quest, Quests, QuestText, QuestFunc
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.middlewares import BaseMiddleware
 
 # выход после обработки, выход без обработки, выход с исключением
 
 
-__all__ = ['UserDataUpdater', 'SwitchConvState', 'get_current_state']
+__all__ = ['UserDataUpdater', 'SwitchConvState', 'HandleException', 'NewData', 'NewState']
 
 T = TypeVar('T')
-StorageData = Union[str, int, list, None]
+_StorageData = Union[str, int, tuple, dict, None]
+StorageData = Union[_StorageData, list[_StorageData]]
 
 
 def to_list(obj) -> list:
+    """Cast obj to list if it's not yet."""
     if not isinstance(obj, list):
         obj = [obj]
     return obj
-
-
-def get_state_by_name(
-        state_name: str, base_states_group: type[ConvStatesGroup] = ConvStatesGroup
-) -> Optional[ConvState]:
-    """Search for State with state_name in subclasses of base_states_group."""
-    for state in base_states_group.all_conv_states:
-        if state.state == state_name:
-            return state
-
-
-async def get_current_state() -> Optional[ConvState]:
-    state_ctx = Dispatcher.get_current().current_state()
-    state_name = await state_ctx.get_state()
-    return get_state_by_name(state_name)
 
 
 def search_in_results(obj_type: type[T], container: list) -> Optional[T]:
@@ -48,12 +35,11 @@ def search_in_results(obj_type: type[T], container: list) -> Optional[T]:
             obj = search_in_results(obj_type, item)
             if obj is not None:  # object found
                 return obj
-    else:
-        if isinstance(container, obj_type):
-            return container
+    elif isinstance(container, obj_type):
+        return container
 
 
-async def ask_question(question: Union[Quest, list[Quest]]):
+async def ask_question(question: Quests):
     """Send message for each Quest in question [current Chat]."""
     chat = types.Chat.get_current()
     bot = Bot.get_current()
@@ -72,40 +58,57 @@ async def ask_question(question: Union[Quest, list[Quest]]):
 
 @dataclass
 class HandleException:
-    on_exception: Quest = None
-    new_state: Union[Literal['previous'], type[ConvStatesGroup], ConvState] = None
-    on_conv_exit: Quest = None
-
-    async def set_new_state(self):
-        if isinstance(self.new_state, ConvState):
-            await self.new_state.set()
-        elif isinstance(self.new_state, type[ConvStatesGroup]):
-            await self.new_state.first()
-        elif self.new_state == 'previous':
-            conv_state: ConvState = await get_current_state()
-            if conv_state and conv_state.group:
-                new_state = conv_state.group.previous()
-                if new_state is None and self.on_conv_exit:
-                    await ask_question(self.on_conv_exit)
+    on_exception: Quests = None
 
 
 @dataclass
 class NewData:
-    set_items: dict[str, StorageData] = field(default_factory=dict)
-    extend_items: dict[str, StorageData] = field(default_factory=dict)
-    del_keys: Union[str, list] = field(default_factory=list)
+    set: dict[str, StorageData] = field(default_factory=dict)
+    extend: dict[str, StorageData] = field(default_factory=dict)
+    delete: Union[str, list] = field(default_factory=list)
 
     async def update_proxy(self, state_ctx: FSMContext):
-        """Set, extend or delete items with state_ctx.proxy()."""
+        """Set, extend or delete items in storage for current User+Chat."""
         async with state_ctx.proxy() as udata:
-            udata.update(self.set_items)
+            udata.update(self.set)
 
-            for key, value in self.extend_items.items():
+            for key, value in self.extend.items():
                 udata.setdefault(key, [])
                 udata[key].extend(to_list(value))
 
-            for key in to_list(self.del_keys):
-                del udata[key]
+            for key in to_list(self.delete):
+                udata.pop(key, None)
+
+
+@dataclass
+class NewState:
+    """Should be used to set specific state, previous state or first state in group."""
+    conv_state: Union[ConvState, type[ConvStatesGroup]] = 'previous'
+    on_conv_exit: Quests = None
+
+    async def get_next_state(self) -> Optional[ConvState]:
+        """Return ConvState(...) to be set next."""
+        next_state = None
+
+        if isinstance(self.conv_state, ConvState):
+            next_state = self.conv_state
+        elif isinstance(self.conv_state, type(ConvStatesGroup)):
+            self.conv_state: type[ConvStatesGroup]
+            next_state = self.conv_state.states[0]
+        elif self.conv_state == 'previous':
+            next_state = await ConvStatesGroup.get_previous_state()
+
+        return next_state
+
+    # async def set_state(self) -> Optional[ConvState]:
+    #     """Set specific state, previous state or first state in group."""
+    # 
+    #     if next_state:
+    #         await next_state.set()
+    #     else:
+    #         state_ctx = Dispatcher.get_current().current_state()
+    #         await state_ctx.finish()
+    #     return next_state
 
 
 class PostMiddleware(BaseMiddleware, ABC):
@@ -128,30 +131,42 @@ class UserDataUpdater(PostMiddleware):
 
     @classmethod
     async def on_post_process_message(cls, msg: types.Message, results: list, *args):
-        state_ctx = Dispatcher.get_current().current_state()
         new_data = search_in_results(NewData, results)
-        await new_data.update_proxy(state_ctx)
+        if new_data:
+            state_ctx = Dispatcher.get_current().current_state()
+            await new_data.update_proxy(state_ctx)
 
 
 class SwitchConvState(PostMiddleware):
-    """Switch state for current User+Chat [if user is in conversation].
+    """Switch state context for current User+Chat.
 
-    # If HandleException in handle results - process exception;
-    # Else if ConvStateGroup in handle results - set first state in group;
-    # Else if user is in conversation - set next state in group;
+    If HandleException in handle results - process exception;
+    Else if NewState in handle results - set new state;
+    Else if user is in conversation - set next state in group and ask question;
     """
 
     @classmethod
     async def on_post_process_message(cls, msg: types.Message, results: list, *args):
-        conv_state: ConvState = get_current_state()
+        state_ctx = Dispatcher.get_current().current_state()
         exception = search_in_results(HandleException, results)
+        new_state = search_in_results(NewState, results)
 
         if exception:
             await ask_question(exception.on_exception)
-            await exception.set_new_state()
-        elif conv_state and conv_state.group:
-            await conv_state.group.next()
-            await ask_question(conv_state.question)
+
+        elif new_state:
+            next_state: ConvState = await new_state.get_next_state()
+            if next_state:
+                await next_state.set()
+                await ask_question(next_state.question)
+            else:
+                await state_ctx.finish()
+                await ask_question(new_state.on_conv_exit)
+
         else:
-            state_ctx = Dispatcher.get_current().current_state()
-            await state_ctx.finish()
+            next_state: ConvState = await ConvStatesGroup.get_next_state()
+            if next_state:
+                await next_state.set()
+                await ask_question(next_state.question)
+            else:
+                await state_ctx.finish()
