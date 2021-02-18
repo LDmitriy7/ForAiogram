@@ -110,6 +110,7 @@ class ConvStatesGroupMeta(StatesGroupMeta):
             return None
 
     def get_state_by_index(cls, group_states: tuple[ConvState], index: int) -> Optional[ConvState]:
+        """Return state with passed index or None. Exception safety."""
         if 0 <= index < len(group_states):
             return group_states[index]
 
