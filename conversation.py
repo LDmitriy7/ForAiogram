@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from dataclasses import field
-from typing import TypeVar, Union, Optional
+from dataclasses import dataclass, field
+from typing import TypeVar, Union, Optional, Literal
 
 from aiogram import types, Dispatcher, Bot
 from aiogram.contrib.questions import ConvState, ConvStatesGroup
@@ -11,14 +10,12 @@ from aiogram.contrib.questions import Quest, Quests, QuestText, QuestFunc
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.middlewares import BaseMiddleware
 
-# TODO: проверка на обработку
-
-
-__all__ = ['UserDataUpdater', 'SwitchConvState', 'HandleException', 'NewData', 'NewState']
+__all__ = ['UpdateData', 'UpdateUserState', 'AnswerOnReturn']
 
 T = TypeVar('T')
 _StorageData = Union[str, int, tuple, dict, None]
 StorageData = Union[_StorageData, list[_StorageData]]
+NewState = Union[Literal['next', 'previous', 'exit'], ConvState, type[ConvStatesGroup], None]
 
 
 def to_list(obj) -> list:
@@ -57,66 +54,76 @@ async def ask_question(question: Quests):
 
 
 @dataclass
-class HandleException:
-    on_exception: Quests = None
+class UpdateData:
+    set_data: dict[str, StorageData] = field(default_factory=dict)
+    extend_data: dict[str, StorageData] = field(default_factory=dict)
+    delete_keys: Union[str, list[str]] = field(default_factory=list)
+    new_state: NewState = 'next'
+    on_conv_exit: Quests = None
 
+    @property
+    def state_ctx(self) -> FSMContext:
+        return Dispatcher.get_current().current_state()
 
-@dataclass
-class NewData:
-    set: dict[str, StorageData] = field(default_factory=dict)
-    extend: dict[str, StorageData] = field(default_factory=dict)
-    delete: Union[str, list[str]] = field(default_factory=list)
-
-    async def update_proxy(self, state_ctx: FSMContext):
+    async def update_storage(self):
         """Set, extend or delete items in storage for current User+Chat."""
-        async with state_ctx.proxy() as udata:
-            udata.update(self.set)
+        async with self.state_ctx.proxy() as udata:
+            udata.update(self.set_data)
 
-            for key, value in self.extend.items():
+            for key, value in self.extend_data.items():
                 udata.setdefault(key, [])
                 udata[key].extend(to_list(value))
 
-            for key in to_list(self.delete):
+            for key in to_list(self.delete_keys):
                 udata.pop(key, None)
 
+    async def get_new_state(self) -> Union[ConvState, bool, None]:
+        """Return new ConvState(...) to be set."""
 
-@dataclass
-class NewState:
-    """Should be used to set specific state, previous state or first state in group."""
-    conv_state: Union[ConvState, type[ConvStatesGroup]] = 'previous'
-    on_conv_exit: Quests = None
+        if isinstance(self.new_state, ConvState):
+            new_state = self.new_state
 
-    async def get_next_state(self) -> Optional[ConvState]:
-        """Return ConvState(...) to be set next."""
-        next_state = None
+        elif isinstance(self.new_state, type(ConvStatesGroup)):
+            self.new_state: type[ConvStatesGroup]
+            new_state = self.new_state.states[0]
 
-        if isinstance(self.conv_state, ConvState):
-            next_state = self.conv_state
-        elif isinstance(self.conv_state, type(ConvStatesGroup)):
-            self.conv_state: type[ConvStatesGroup]
-            next_state = self.conv_state.states[0]
-        elif self.conv_state == 'previous':
-            next_state = await ConvStatesGroup.get_previous_state()
+        elif self.new_state == 'previous':
+            new_state = await ConvStatesGroup.get_previous_state()
 
-        return next_state
+        elif self.new_state == 'next':
+            new_state = await ConvStatesGroup.get_next_state()
 
-    # async def set_state(self) -> Optional[ConvState]:
-    #     """Set specific state, previous state or first state in group."""
-    #
-    #     if next_state:
-    #         await next_state.set()
-    #     else:
-    #         state_ctx = Dispatcher.get_current().current_state()
-    #         await state_ctx.finish()
-    #     return next_state
+        elif self.new_state == 'exit':
+            new_state = None
+
+        elif self.new_state is None:
+            new_state = False
+
+        else:
+            new_state = None
+
+        return new_state
+
+    async def switch_state(self, new_state: Union[ConvState, bool, None]):
+        """
+        If ConvState(...) passed - set new state and ask question;
+        Elif None passed - finish conversation with on_conv_exit;
+        Else - do nothing
+        """
+        if new_state is None:
+            await self.state_ctx.finish()
+            await ask_question(self.on_conv_exit)
+        elif isinstance(new_state, ConvState):
+            await new_state.set()
+            await ask_question(new_state.question)
 
 
 class PostMiddleware(BaseMiddleware, ABC):
     """Abstract Middleware for post processing Message and CallbackQuery."""
 
-    @classmethod
+    @staticmethod
     @abstractmethod
-    async def on_post_process_message(cls, msg: types.Message, results: list, state_dict: dict):
+    async def on_post_process_message(msg: types.Message, results: list, state_dict: dict):
         """Works after processing any message by handler."""
 
     @classmethod
@@ -126,47 +133,31 @@ class PostMiddleware(BaseMiddleware, ABC):
         await cls.on_post_process_message(query.message, results, state_dict)
 
 
-class UserDataUpdater(PostMiddleware):
-    """Search for NewData(...) in handle results. Update storage for current User+Chat with new data."""
+class UpdateUserState(PostMiddleware):
+    """Handle returned from handler UpdateData instance.
 
-    @classmethod
-    async def on_post_process_message(cls, msg: types.Message, results: list, *args):
-        new_data = search_in_results(NewData, results)
-        if new_data:
-            state_ctx = Dispatcher.get_current().current_state()
-            await new_data.update_proxy(state_ctx)
-
-
-class SwitchConvState(PostMiddleware):
-    """Switch state context for current User+Chat.
-
-    If HandleException in handle results - process exception;
-    Else if NewState in handle results - set new state;
-    Else if user is in conversation - set next state in group and ask question;
+    1) Update storage for current User+Chat (set, extend or delete items).
+    2) Switch state context for current User+Chat.
+      Set new ConvState(...) and ask question; or
+      Finish conversation with on_conv_exit; or
+      Do nothing
     """
 
-    @classmethod
-    async def on_post_process_message(cls, msg: types.Message, results: list, *args):
-        state_ctx = Dispatcher.get_current().current_state()
-        exception = search_in_results(HandleException, results)
-        new_state = search_in_results(NewState, results)
+    @staticmethod
+    async def on_post_process_message(msg: types.Message, results: list, *args):
+        new_data = search_in_results(UpdateData, results)
 
-        if exception:
-            await ask_question(exception.on_exception)
+        if new_data:
+            await new_data.update_storage()
+            new_state = await new_data.get_new_state()
+            await new_data.switch_state(new_state)
 
-        elif new_state:
-            next_state: ConvState = await new_state.get_next_state()
-            if next_state:
-                await next_state.set()
-                await ask_question(next_state.question)
-            else:
-                await state_ctx.finish()
-                await ask_question(new_state.on_conv_exit)
 
-        else:
-            next_state: ConvState = await ConvStatesGroup.get_next_state()
-            if next_state:
-                await next_state.set()
-                await ask_question(next_state.question)
-            else:
-                await state_ctx.finish()
+class AnswerOnReturn(PostMiddleware):
+    """Ask question from returned string, QuestText or QuestFunc."""
+
+    @staticmethod
+    async def on_post_process_message(msg: types.Message, results: list, state_dict: dict):
+        question = search_in_results((str, QuestText, QuestFunc), results)
+        if question:
+            await ask_question(question)
