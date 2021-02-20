@@ -47,23 +47,28 @@ class ConvStatesGroupMeta(StatesGroupMeta):
 
         return super().__new__(mcs, class_name, bases, namespace)
 
-    def all_conv_states(cls) -> list[ConvState]:
-        """Search for all ConvState(...) in all sublasses."""
+    @property
+    def state_ctx(cls):
+        return Dispatcher.get_current().current_state()
+
+    @property
+    def all_child_states(cls) -> list[ConvState]:
+        """Search for all ConvState(...) in all ConvStatesGroup sublasses."""
         all_states = []
-        for conv_group in cls.__subclasses__():
+        for conv_group in ConvStatesGroup.__subclasses__():
             all_states.extend(conv_group.all_states)
         return all_states
 
     def get_state_by_name(cls, state_name: str) -> Optional[ConvState]:
-        """Search for State with state_name in subclasses."""
-        for state in cls.all_conv_states():
+        """Search for ConvState with state_name in all ConvStatesGroups."""
+        for state in cls.all_child_states:
             if state.state == state_name:
                 return state
 
     async def get_current_state(cls) -> Optional[ConvState]:
+        """Search current ConvState(...) in all ConvStatesGroups."""
         try:
-            state_ctx = Dispatcher.get_current().current_state()
-            state_name = await state_ctx.get_state()
+            state_name = await cls.state_ctx.get_state()
             state = cls.get_state_by_name(state_name)
             return state
         except AttributeError:
@@ -89,7 +94,7 @@ class ConvStatesGroupMeta(StatesGroupMeta):
             return None
 
         previous_step = group_states.index(state) - 1
-        return cls.get_state_by_index(group_states, next_step)
+        return cls.get_state_by_index(group_states, previous_step)
 
     async def __get_first_group_state(cls) -> Optional[ConvState]:
         state = await cls.get_current_state()
@@ -109,7 +114,8 @@ class ConvStatesGroupMeta(StatesGroupMeta):
         except AttributeError:
             return None
 
-    def get_state_by_index(cls, group_states: tuple[ConvState], index: int) -> Optional[ConvState]:
+    @staticmethod
+    def get_state_by_index(group_states: tuple[ConvState], index: int) -> Optional[ConvState]:
         """Return state with passed index or None. Exception safety."""
         if 0 <= index < len(group_states):
             return group_states[index]
@@ -117,3 +123,15 @@ class ConvStatesGroupMeta(StatesGroupMeta):
 
 class ConvStatesGroup(StatesGroup, metaclass=ConvStatesGroupMeta):
     """StatesGroup with only ConvState(...) attributes (not State)."""
+
+
+class SingleConvStatesGroup(ConvStatesGroup):
+    """ConvStatesGroup with single states (no switching)."""
+
+    @classmethod
+    async def get_next_state(cls) -> None:
+        return None
+
+    @classmethod
+    async def get_previous_state(cls) -> None:
+        return None
