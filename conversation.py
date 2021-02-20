@@ -5,10 +5,11 @@ from dataclasses import dataclass, field
 from typing import TypeVar, Union, Optional, Literal
 
 from aiogram import types, Dispatcher, Bot
-from aiogram.contrib.questions import ConvState, ConvStatesGroup
+from aiogram.contrib.questions import ConvState, ConvStatesGroup, SingleConvStatesGroup, ConvStatesGroupMeta
 from aiogram.contrib.questions import Quest, Quests, QuestText, QuestFunc
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.middlewares import BaseMiddleware
+from aiogram.dispatcher.storage import FSMContextProxy
 
 __all__ = ['UpdateData', 'UpdateUserState', 'AnswerOnReturn']
 
@@ -57,6 +58,7 @@ async def ask_question(question: Quests):
 class UpdateData:
     set_data: dict[str, StorageData] = field(default_factory=dict)
     extend_data: dict[str, StorageData] = field(default_factory=dict)
+    remove_data: dict[str, StorageData] = field(default_factory=dict)
     delete_keys: Union[str, list[str]] = field(default_factory=list)
     new_state: NewState = 'next'
     on_conv_exit: Quests = None
@@ -65,44 +67,62 @@ class UpdateData:
     def state_ctx(self) -> FSMContext:
         return Dispatcher.get_current().current_state()
 
+    def _extend_data(self, proxy: FSMContextProxy, no_error=True):
+        for key, value in self.extend_data.items():
+            if no_error:
+                proxy.setdefault(key, [])
+            proxy[key].extend(to_list(value))
+
+    def _remove_data(self, proxy: FSMContextProxy, no_error=True):
+        for key, value in self.remove_data.items():
+            for item in to_list(value):
+                if no_error:
+                    if item in proxy[key]:
+                        proxy[key].remove(item)
+                else:
+                    proxy[key].remove(item)
+
+    def _delete_keys(self, proxy: FSMContextProxy, no_error=True):
+        for key in to_list(self.delete_keys):
+            if no_error:
+                proxy.pop(key)
+            else:
+                del proxy[key]
+
     async def update_storage(self):
         """Set, extend or delete items in storage for current User+Chat."""
         async with self.state_ctx.proxy() as udata:
             udata.update(self.set_data)
-
-            for key, value in self.extend_data.items():
-                udata.setdefault(key, [])
-                udata[key].extend(to_list(value))
-
-            for key in to_list(self.delete_keys):
-                udata.pop(key, None)
+            self._extend_data(udata)
+            self._remove_data(udata)
+            self._delete_keys(udata)
 
     async def get_new_state(self) -> Union[ConvState, bool, None]:
         """Return new ConvState(...) to be set."""
 
         if isinstance(self.new_state, ConvState):
-            new_state = self.new_state
+            return self.new_state
 
-        elif isinstance(self.new_state, type(ConvStatesGroup)):
-            self.new_state: type[ConvStatesGroup]
-            new_state = self.new_state.states[0]
+        if isinstance(self.new_state, ConvStatesGroupMeta):
+            return self.new_state.states[0]
 
-        elif self.new_state == 'previous':
+        if self.new_state == 'previous':
             new_state = await ConvStatesGroup.get_previous_state()
+            if isinstance(new_state, SingleConvStatesGroup):
+                return None
+            return new_state
 
-        elif self.new_state == 'next':
+        if self.new_state == 'next':
             new_state = await ConvStatesGroup.get_next_state()
+            if isinstance(new_state, SingleConvStatesGroup):
+                return None
+            return new_state
 
-        elif self.new_state == 'exit':
-            new_state = None
+        if self.new_state == 'exit':
+            return None
 
-        elif self.new_state is None:
-            new_state = False
-
-        else:
-            new_state = None
-
-        return new_state
+        if self.new_state is None:
+            return False
 
     async def switch_state(self, new_state: Union[ConvState, bool, None]):
         """
