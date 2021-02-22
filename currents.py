@@ -209,19 +209,11 @@ class MessageText(Message):
 
 if __name__ == '__main__':
     from asyncio import get_event_loop
-    from loader import dp
-
-
-    class T(StatesGroup):
-        ask_price = _State()
-
 
     loop = get_event_loop()
 
     types.User.set_current(types.User(id=123, username='LDM7'))
     types.Chat.set_current(types.Chat(type='private'))
-    Dispatcher.set_current(dp)
-    loop.run_until_complete(Dispatcher.get_current().current_state().set_state('T:ask_price'))
 
 
     @User
@@ -232,7 +224,7 @@ if __name__ == '__main__':
     @InlineQuery
     @Bot
     @UserData
-    @RawState
+    @RawState(default='null')
     @State
     @UserID
     @UserName
@@ -248,4 +240,5 @@ if __name__ == '__main__':
         print(kwargs)
 
 
+    loop.run_until_complete(test())
     loop.run_until_complete(test2())
